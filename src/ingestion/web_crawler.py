@@ -31,12 +31,16 @@ MAX_PAGES = 20
 MAX_DEPTH = 2
 REQUEST_DELAY_SECONDS = 2
 
+# Skip pages with very little extracted content.
+MIN_CONTENT_LENGTH = 300
+
 USER_AGENT = "BankBotV2EducationalCrawler/0.1"
 
 OUTPUT_DIR = BASE_DIR / "data" / "raw" / "web_scraped"
 REGISTRY_PATH = BASE_DIR / "data" / "raw" / "source_registry.csv"
 
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+REGISTRY_PATH.parent.mkdir(parents=True, exist_ok=True)
 
 session = requests.Session()
 session.headers.update({"User-Agent": USER_AGENT})
@@ -49,7 +53,7 @@ robots_cache = {}
 # -----------------------------
 
 def normalize_url(url):
-    """Remove URL fragments and normalize trailing slashes."""
+    """Remove fragments and normalize trailing slashes."""
     url, _ = urldefrag(url)
 
     parsed = urlparse(url)
@@ -57,8 +61,8 @@ def normalize_url(url):
     if parsed.scheme not in ("http", "https"):
         return None
 
+    # Skip query-string URLs for now.
     if parsed.query:
-        # Skip query-string URLs in this first version.
         return None
 
     normalized = parsed._replace(
@@ -85,16 +89,93 @@ def is_allowed_domain(url):
 
 
 def is_html_url(url):
-    """Skip files such as PDFs, images, and office documents."""
+    """Skip PDFs, images, and other non-HTML files."""
     path = urlparse(url).path.lower()
 
     blocked_extensions = (
         ".pdf", ".jpg", ".jpeg", ".png", ".gif",
         ".zip", ".doc", ".docx", ".xls", ".xlsx",
-        ".ppt", ".pptx", ".mp4", ".mp3"
+        ".ppt", ".pptx", ".mp4", ".mp3",
     )
 
     return not path.endswith(blocked_extensions)
+
+
+def is_relevant_url(url):
+    """
+    Restrict crawling to URLs likely to contain banking information.
+
+    This is a first-pass filter, not a guarantee that every page
+    discovered will be relevant.
+    """
+    path = urlparse(url).path.lower()
+
+    relevant_keywords = (
+        "account",
+        "saving",
+        "deposit",
+        "loan",
+        "card",
+        "banking",
+        "digital",
+        "yono",
+        "nri",
+        "business",
+        "remittance",
+        "pension",
+        "investment",
+        "kyc",
+        "fee",
+        "charge",
+        "rtgs",
+        "neft",
+        "upi",
+        "forex",
+        "forex",
+        "agri",
+        "rural",
+        "insurance",
+    )
+
+    excluded_keywords = (
+        "/blog/",
+        "/marketing-insights",
+        "/coe-chakra/",
+        "/web/business/information/country",
+        "quarterly-progress-reports",
+    )
+
+    if any(keyword in path for keyword in excluded_keywords):
+        return False
+
+    return any(keyword in path for keyword in relevant_keywords)
+
+
+def categorize_url(url):
+    """Assign a category based on the SBI URL path."""
+    path = urlparse(url).path.lower()
+
+    category_rules = [
+        ("nri_banking", ("nri",)),
+        ("business_banking", ("business", "sme", "corporate")),
+        ("loans", ("loan",)),
+        ("cards", ("card",)),
+        ("digital_banking", ("digital", "yono", "upi", "internet-banking")),
+        ("accounts", ("account", "saving")),
+        ("deposits", ("deposit", "fd", "fixed-deposit", "rd")),
+        ("fees_and_charges", ("fee", "charge")),
+        ("remittances", ("remittance",)),
+        ("investments", ("investment", "ppf", "mutual-fund", "securities")),
+        ("eligibility", ("eligibility",)),
+        ("policies", ("policy", "kyc", "continuity", "guideline")),
+        ("agri_rural_banking", ("agri", "rural", "kisan")),
+    ]
+
+    for category, keywords in category_rules:
+        if any(keyword in path for keyword in keywords):
+            return category
+
+    return "other"
 
 
 # -----------------------------
@@ -117,9 +198,11 @@ def get_robots_parser(url):
 
         if response.status_code == 200:
             parser.parse(response.text.splitlines())
+
         elif response.status_code == 404:
             # No robots.txt file found.
             parser.parse([])
+
         else:
             # If robots.txt cannot be checked, do not crawl this host.
             parser.parse(["User-agent: *", "Disallow: /"])
@@ -128,6 +211,7 @@ def get_robots_parser(url):
         parser.parse(["User-agent: *", "Disallow: /"])
 
     robots_cache[robots_url] = parser
+
     return parser
 
 
@@ -140,8 +224,11 @@ def can_crawl(url):
 # Page extraction
 # -----------------------------
 
-def extract_page(url):
-    """Download a webpage and extract its title and main content."""
+def fetch_page(url):
+    """
+    Fetch a page once and return its title, extracted content,
+    and BeautifulSoup object for link discovery.
+    """
     try:
         response = session.get(url, timeout=30)
         response.raise_for_status()
@@ -150,7 +237,7 @@ def extract_page(url):
 
         if "text/html" not in content_type:
             print(f"Skipping non-HTML content: {url}")
-            return None, None
+            return None, None, None
 
         html = response.text
 
@@ -162,53 +249,45 @@ def extract_page(url):
             else "Untitled page"
         )
 
-        text_content = trafilatura.extract(
+        content = trafilatura.extract(
             html,
             include_links=True,
             include_tables=True,
         )
 
-        if not text_content:
-            print(f"No main content extracted: {url}")
-            return title, None
-
-        return title, text_content
+        return title, content, soup
 
     except requests.RequestException as error:
         print(f"Request failed: {url} | {error}")
-        return None, None
+        return None, None, None
 
 
-def extract_links(url):
-    """Find eligible links on the current page."""
-    try:
-        response = session.get(url, timeout=30)
-        response.raise_for_status()
+def extract_links(url, soup):
+    """Find eligible links from an already downloaded page."""
+    discovered_links = set()
 
-        soup = BeautifulSoup(response.text, "html.parser")
-
-        discovered_links = set()
-
-        for anchor in soup.find_all("a", href=True):
-            absolute_url = urljoin(url, anchor["href"])
-            normalized_url = normalize_url(absolute_url)
-
-            if not normalized_url:
-                continue
-
-            if not is_allowed_domain(normalized_url):
-                continue
-
-            if not is_html_url(normalized_url):
-                continue
-
-            discovered_links.add(normalized_url)
-
+    if soup is None:
         return discovered_links
 
-    except requests.RequestException as error:
-        print(f"Could not extract links from {url}: {error}")
-        return set()
+    for anchor in soup.find_all("a", href=True):
+        absolute_url = urljoin(url, anchor["href"])
+        normalized_url = normalize_url(absolute_url)
+
+        if not normalized_url:
+            continue
+
+        if not is_allowed_domain(normalized_url):
+            continue
+
+        if not is_html_url(normalized_url):
+            continue
+
+        if not is_relevant_url(normalized_url):
+            continue
+
+        discovered_links.add(normalized_url)
+
+    return discovered_links
 
 
 # -----------------------------
@@ -216,7 +295,7 @@ def extract_links(url):
 # -----------------------------
 
 def save_document(url, title, content, depth):
-    """Save extracted page as Markdown and add registry metadata."""
+    """Save extracted webpage as Markdown and add registry metadata."""
     scraped_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
     url_hash = hashlib.sha256(url.encode("utf-8")).hexdigest()[:12]
@@ -224,11 +303,15 @@ def save_document(url, title, content, depth):
 
     output_path = OUTPUT_DIR / filename
 
+    category = categorize_url(url)
+
+    safe_title = title.replace('"', "'")
+
     markdown = f"""---
-title: "{title.replace('"', "'")}"
+title: "{safe_title}"
 source_url: "{url}"
 source_name: "SBI"
-category: "unclassified"
+category: "{category}"
 document_type: "webpage"
 scraped_at: "{scraped_at}"
 crawl_depth: {depth}
@@ -276,7 +359,7 @@ Scraped at: {scraped_at}
         writer.writerow([
             document_id,
             title,
-            "unclassified",
+            category,
             url,
             "SBI",
             "webpage",
@@ -285,7 +368,7 @@ Scraped at: {scraped_at}
             "scraped",
         ])
 
-    print(f"Saved: {title}")
+    print(f"Saved [{category}]: {title}")
 
 
 # -----------------------------
@@ -315,15 +398,22 @@ def crawl():
         if not is_allowed_domain(current_url):
             continue
 
+        if not is_html_url(current_url):
+            continue
+
+        if not is_relevant_url(current_url):
+            continue
+
         if not can_crawl(current_url):
             print(f"Blocked by robots.txt: {current_url}")
             continue
 
         print(f"\nCrawling depth={depth}: {current_url}")
 
-        title, content = extract_page(current_url)
+        title, content, soup = fetch_page(current_url)
 
-        if content:
+        # Only save pages with enough extracted text.
+        if content and len(content.strip()) >= MIN_CONTENT_LENGTH:
             save_document(
                 current_url,
                 title,
@@ -332,8 +422,18 @@ def crawl():
             )
             saved_count += 1
 
-        if depth < MAX_DEPTH:
-            links = extract_links(current_url)
+        elif content:
+            print(
+                f"Skipping short content "
+                f"({len(content.strip())} characters): {current_url}"
+            )
+
+        else:
+            print(f"Skipping page with no extracted content: {current_url}")
+
+        # Discover relevant links from the same downloaded page.
+        if soup and depth < MAX_DEPTH:
+            links = extract_links(current_url, soup)
 
             for link in links:
                 if link not in visited:
