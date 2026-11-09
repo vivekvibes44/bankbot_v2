@@ -1,0 +1,29 @@
+# Application
+streamlit
+
+# LangChain core
+langchain
+langchain-core
+langchain-community
+langchain-text-splitters
+
+# LLM and embeddings
+langchain-groq
+langchain-openai
+
+# Vector store
+faiss-cpu
+
+# Document processing
+pypdf
+pdfplumber
+beautifulsoup4
+
+# Keyword retrieval
+rank-bm25
+
+# Environment configuration
+python-dotenv
+
+# HTTP requests
+requests

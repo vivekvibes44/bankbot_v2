@@ -1,0 +1,29 @@
+
+# Environment
+.venv/
+.env
+.env.*
+!.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Vector database
+vector_store/
+
+# Data
+data/raw/
+data/processed/
+
+# Streamlit
+.streamlit/secrets.toml
+
+# IDE
+.vscode/
+
+# Logs
+*.log
+
+requirements_and_architecture.md
