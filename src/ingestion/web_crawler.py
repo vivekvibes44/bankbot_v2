@@ -156,13 +156,17 @@ def categorize_url(url):
     path = urlparse(url).path.lower()
 
     category_rules = [
+        # NRI is treated as a broad customer segment.
         ("nri_banking", ("nri",)),
-        ("business_banking", ("business", "sme", "corporate")),
+
+        # Loan products take priority over business banking.
         ("loans", ("loan",)),
+
+        ("deposits", ("deposit", "fd", "fixed-deposit", "rd")),
         ("cards", ("card",)),
         ("digital_banking", ("digital", "yono", "upi", "internet-banking")),
         ("accounts", ("account", "saving")),
-        ("deposits", ("deposit", "fd", "fixed-deposit", "rd")),
+        ("business_banking", ("business", "sme", "corporate")),
         ("fees_and_charges", ("fee", "charge")),
         ("remittances", ("remittance",)),
         ("investments", ("investment", "ppf", "mutual-fund", "securities")),
@@ -260,6 +264,42 @@ def fetch_page(url):
     except requests.RequestException as error:
         print(f"Request failed: {url} | {error}")
         return None, None, None
+
+
+def clean_content(content):
+    """Remove repeated SBI website disclaimer paragraphs."""
+
+    if not content:
+        return ""
+
+    boilerplate_markers = (
+        "contents have been translated from english version",
+        "in case of any ambiguity or doubt",
+        "sbi makes no warranty or representation regarding any content",
+        "any action on your part on the basis of the said content",
+        "the content of this website shall not be displayed or printed",
+        "as the translated content here is ai generated",
+        "users are advised to refer to the english contents",
+        "third party website",
+        "proceed at your own risk",
+    )
+
+    paragraphs = content.split("\\n\\n")
+    cleaned_paragraphs = []
+
+    for paragraph in paragraphs:
+        normalized = paragraph.strip().lower()
+
+        if not normalized:
+            continue
+
+        # Remove only paragraphs matching known disclaimer wording.
+        if any(marker in normalized for marker in boilerplate_markers):
+            continue
+
+        cleaned_paragraphs.append(paragraph.strip())
+
+    return "\\n\\n".join(cleaned_paragraphs)
 
 
 def extract_links(url, soup):
@@ -412,7 +452,11 @@ def crawl():
 
         title, content, soup = fetch_page(current_url)
 
-        # Only save pages with enough extracted text.
+        # Remove repeated website disclaimers before checking content length.
+        if content:
+            content = clean_content(content)
+
+        # Only save pages with enough useful extracted text.
         if content and len(content.strip()) >= MIN_CONTENT_LENGTH:
             save_document(
                 current_url,
